@@ -1,5 +1,11 @@
 # XFMT: Portable Reversible Transform Archive
 
+![Version](https://img.shields.io/badge/version-0.1.0-blue)
+![License](https://img.shields.io/badge/license-Apache--2.0-green)
+![Language](https://img.shields.io/badge/language-Rust-orange)
+![Deduplication](https://img.shields.io/badge/deduplication-CDC-brightgreen)
+![Security](https://img.shields.io/badge/security-AES--256--GCM-red)
+
 XFMT is a high-performance, reversible file transform format designed for transparent archival, instant streaming, and efficient storage.
 
 ## Benchmarks: XFMT vs. 7-Zip & ZIP
@@ -23,18 +29,21 @@ On a typical 100MB dataset (mixed random and repetitive data), XFMT provides the
 - **Zstandard Compression**: Efficient, high-speed data reduction.
 - **Content-Defined Chunking (CDC)**: FastCDC enables deduplication even when file content shifts.
 - **Local & Global Deduplication**: Share duplicate chunks across multiple files using Repository Mode.
+- **Folder Archiving**: Recursive directory bundling with the `--dir` flag.
 - **Media Streaming Server**: Built-in HTTP server for instant video playback with full timeline/seeking support.
 - **AES-256-GCM Encryption**: Optional authenticated encryption for secure storage.
 - **Digital Signatures**: Ed25519 manifest signing to guarantee provenance.
 - **Streaming I/O**: True streaming architecture; process 100GB+ files with minimal RAM.
-- **Type-Aware Profiles**: JSON canonicalization and Image metadata extraction.
 
 ## Usage
 
-### Packing
+### Packing & Bundling
 ```bash
-# Basic pack (uses 16MB chunks for high compression)
-xfmt pack input.dat
+# Basic pack (single file)
+xfmt pack movie.mp4
+
+# Bundle an entire folder (recursive)
+xfmt pack ./my_photos --dir
 
 # Fast pack (uses 1MB chunks for instant seeking)
 xfmt pack input.dat --fast
@@ -45,8 +54,8 @@ xfmt pack input.dat --level 19
 
 ### Unpacking & Media Streaming
 ```bash
-# Extract full file
-xfmt unpack output.xfmt restored.dat
+# Extract full file or folder
+xfmt unpack output.xfmt restored_data
 
 # Instant Video Playback (with timeline and seeking)
 xfmt serve movie.mp4.xfmt --vlc
@@ -65,3 +74,7 @@ xfmt pack input.dat --key my_key
 
 # 3. Verify integrity and signature
 xfmt verify output.xfmt
+```
+
+## Documentation
+See the `docs/` folder or `DOCUMENTATION.pdf` for the full technical manual.

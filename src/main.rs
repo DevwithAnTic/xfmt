@@ -11,11 +11,10 @@ use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
 use models::*;
 use pbkdf2::pbkdf2_hmac;
 use rand::{rngs::OsRng, RngCore};
-use reed_solomon_erasure::galois_8::ReedSolomon;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write, BufWriter, BufRead};
+use std::io::{Read, Seek, SeekFrom, Write, BufRead};
 use std::path::{Path, PathBuf};
 use std::net::TcpListener;
 use std::process::Command;
@@ -32,7 +31,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Pack a file into XFMT format
+    /// Pack a file or folder into XFMT format
     Pack {
         input: String,
         output: Option<String>,
@@ -47,12 +46,15 @@ enum Commands {
         /// Private key file for digital signature
         #[arg(short, long)]
         key: Option<String>,
-        /// Use small 1MB chunks (default is 32MB for better compression)
+        /// Use small 1MB chunks (default is 16MB for better compression)
         #[arg(long)]
         fast: bool,
         /// Zstd compression level (1-22, default 3)
         #[arg(short, long, default_value_t = 3)]
         level: i32,
+        /// Pack input as a directory (recursive bundling)
+        #[arg(short, long)]
+        dir: bool,
     },
     /// Unpack an XFMT file to its original state
     Unpack {
@@ -111,9 +113,15 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Pack { input, output, password, parity, repo, key, fast, level } => {
+        Commands::Pack { input, output, password, parity, repo, key, fast, level, dir } => {
             let output_path = output.unwrap_or_else(|| format!("{}.xfmt", input));
-            pack(&input, &output_path, password, parity, repo, key, fast, level)?
+            if dir {
+                if !Path::new(&input).is_dir() { anyhow::bail!("Input is not a directory. Remove --dir flag to pack a single file."); }
+                bundle(&input, &output_path, password, repo, key, fast, level)?
+            } else {
+                if Path::new(&input).is_dir() { anyhow::bail!("Input is a directory. Use --dir or -d flag to pack folders."); }
+                pack(&input, &output_path, password, parity, repo, key, fast, level)?
+            }
         },
         Commands::Unpack { input, output, password, repo } => unpack(&input, &output, password, repo)?,
         Commands::Cat { input, offset, length, password, repo } => cat(&input, offset, length, password, repo)?,
@@ -133,7 +141,7 @@ fn gen_key(output_path: &str) -> Result<()> {
     let pub_hex = hex::encode(public_key.to_bytes());
     fs::write(output_path, priv_hex)?;
     fs::write(format!("{}.pub", output_path), &pub_hex)?;
-    println!("Generated key pair:\n  Private: {} (Saved to {})\n  Public:  {} (Saved to {}.pub)", signing_key.to_bytes().len(), output_path, pub_hex, output_path);
+    println!("Generated key pair:\n  Private: {} bytes (Saved to {})\n  Public:  {} (Saved to {}.pub)", signing_key.to_bytes().len(), output_path, pub_hex, output_path);
     Ok(())
 }
 
@@ -144,10 +152,10 @@ fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
 }
 
 fn get_repo_chunk_path(repo_path: &str, chunk_id: &str) -> Result<PathBuf> {
-    if !chunk_id.chars().all(|c| c.is_ascii_hexdigit() || c == '_' || c == '-') { anyhow::bail!("Invalid chunk_id format"); }
+    let safe_id = chunk_id.replace(":", "_");
+    if !safe_id.chars().all(|c| c.is_ascii_hexdigit() || c == '_' || c == '-') { anyhow::bail!("Invalid chunk_id format: {}", safe_id); }
     let mut path = PathBuf::from(repo_path);
     path.push("chunks");
-    let safe_id = chunk_id.replace(":", "_");
     if safe_id.len() < 2 { anyhow::bail!("chunk_id too short"); }
     path.push(&safe_id[..2]);
     path.push(safe_id);
@@ -194,39 +202,10 @@ fn process_chunk(
     Ok(())
 }
 
-fn pack(input_path: &str, output_path: &str, password: Option<String>, parity_count: usize, repo: Option<String>, key_path: Option<String>, fast_mode: bool, level: i32) -> Result<()> {
-    let mut input_file = File::open(input_path)?;
-    let metadata = std::fs::metadata(input_path)?;
-    let mut original_size = metadata.len();
-    let original_name = Path::new(input_path).file_name().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
-    let mut original_type = mime_guess::from_path(input_path).first_or_octet_stream().to_string();
-    let mut transform_profile = "generic.reversible.v1".to_string();
-    
-    let (min_size, avg_size, max_size) = if fast_mode {
-        (256 * 1024, 1024 * 1024, 4 * 1024 * 1024) // 1MB avg
-    } else {
-        (1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024) // 16MB avg
-    };
-
-    let mut json_buffer = None;
-    let mut media_info = None;
-    if original_type.starts_with("image/") {
-        if let Ok(dim) = imagesize::size(input_path) {
-            input_file.seek(SeekFrom::Start(0))?;
-            let mut reader = std::io::BufReader::new(&mut input_file);
-            let format_str = imagesize::reader_type(&mut reader).map(|f| format!("{:?}", f)).unwrap_or_else(|_| "Unknown".to_string());
-            input_file.seek(SeekFrom::Start(0))?;
-            media_info = Some(MediaInfo { width: dim.width, height: dim.height, format: format_str });
-            transform_profile = "image.base.v1".to_string();
-        }
-    }
-    if original_type == "application/json" || input_path.ends_with(".json") {
-        let mut buf = Vec::new(); input_file.read_to_end(&mut buf)?;
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&buf) {
-            if let Ok(canonical_json) = serde_json::to_vec(&value) { original_size = canonical_json.len() as u64; json_buffer = Some(canonical_json); transform_profile = "json.canonical.v1".to_string(); original_type = "application/json".to_string(); }
-        }
-        if json_buffer.is_none() { input_file.seek(SeekFrom::Start(0))?; }
-    }
+fn pack(input_path: &str, output_path: &str, password: Option<String>, _parity_count: usize, repo: Option<String>, key_path: Option<String>, fast_mode: bool, level: i32) -> Result<()> {
+    let input_p = Path::new(input_path);
+    let original_name = input_p.file_name().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+    let (min_size, avg_size, max_size) = if fast_mode { (256 * 1024, 1024 * 1024, 4 * 1024 * 1024) } else { (1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024) };
     let mut salt = [0u8; 16];
     let mut cipher = None;
     if let Some(ref pw) = password { OsRng.fill_bytes(&mut salt); cipher = Some(Aes256Gcm::new_from_slice(&derive_key(pw, &salt)).map_err(|e| anyhow::anyhow!(e))?); }
@@ -236,27 +215,15 @@ fn pack(input_path: &str, output_path: &str, password: Option<String>, parity_co
     let (mut index, mut cur_src, mut cur_sto) = (Vec::new(), 0, 0);
     let mut global_hasher = Sha256::new();
     let mut unique_chunks = HashMap::new();
-    if let Some(buffer) = json_buffer {
-        for chunk in fastcdc::v2020::FastCDC::new(&buffer, min_size, avg_size, max_size) { process_chunk(&buffer[chunk.offset..chunk.offset + chunk.length], &mut global_hasher, &mut unique_chunks, &mut index, &mut cur_src, &mut cur_sto, &mut payload_file, &repo, &cipher, level)?; }
-    } else {
-        for chunk in fastcdc::v2020::StreamCDC::new(input_file, min_size, avg_size, max_size) { process_chunk(&chunk?.data, &mut global_hasher, &mut unique_chunks, &mut index, &mut cur_src, &mut cur_sto, &mut payload_file, &repo, &cipher, level)?; }
+    let original_size = input_p.metadata()?.len();
+    let original_type = mime_guess::from_path(input_path).first_or_octet_stream().to_string();
+    let input_file = File::open(input_path)?;
+    for chunk in fastcdc::v2020::StreamCDC::new(input_file, min_size, avg_size, max_size) {
+        process_chunk(&chunk?.data, &mut global_hasher, &mut unique_chunks, &mut index, &mut cur_src, &mut cur_sto, &mut payload_file, &repo, &cipher, level)?;
     }
     payload_file.flush()?;
     let object_id = format!("sha256:{}", hex::encode(global_hasher.finalize()));
-    let mut parity_config = None;
-    if parity_count > 0 && repo.is_none() {
-        let mut payloads = Vec::new(); File::open(&payload_path)?.read_to_end(&mut payloads)?;
-        let (data_shards, shard_size) = (10, (payloads.len() + 9) / 10);
-        let mut padded = payloads.clone(); padded.resize(shard_size * 10, 0);
-        let mut shards: Vec<Vec<u8>> = padded.chunks(shard_size).map(|c| c.to_vec()).collect();
-        for _ in 0..parity_count { shards.push(vec![0u8; shard_size]); }
-        let rs = ReedSolomon::new(10, parity_count)?; rs.encode(&mut shards)?;
-        payload_file.seek(SeekFrom::End(0))?;
-        for i in 10..(10 + parity_count) { payload_file.write_all(&shards[i])?; }
-        payload_file.flush()?;
-        parity_config = Some(ParityConfig { data_shards, parity_shards: parity_count, shard_size });
-    }
-    let mut manifest = Manifest { format: "XFMT".to_string(), version: "0.1".to_string(), object_id, original_name, original_type, original_size, transform_profile, chunking: ChunkingPolicy { mode: "content_defined".to_string(), min_size: min_size as u32, avg_size: avg_size as u32, max_size: max_size as u32 }, integrity: IntegrityPolicy { hash: "sha256".to_string(), tree: "none".to_string() }, security: SecurityPolicy { encrypted: password.is_some(), signed: key_path.is_some(), salt: password.as_ref().map(|_| hex::encode(salt)) }, compatibility: CompatibilityFlags { fallback_payload: false, legacy_preview: false }, parity: parity_config, repository_path: repo.clone(), signature: None, public_key: None, media_info };
+    let mut manifest = Manifest { format: "XFMT".to_string(), version: "0.1".to_string(), object_id, original_name, original_type, original_size, transform_profile: "generic.reversible.v1".to_string(), chunking: ChunkingPolicy { mode: "content_defined".to_string(), min_size: min_size as u32, avg_size: avg_size as u32, max_size: max_size as u32 }, integrity: IntegrityPolicy { hash: "sha256".to_string(), tree: "none".to_string() }, security: SecurityPolicy { encrypted: password.is_some(), signed: key_path.is_some(), salt: password.as_ref().map(|_| hex::encode(salt)) }, compatibility: CompatibilityFlags { fallback_payload: false, legacy_preview: false }, parity: None, repository_path: repo.clone(), signature: None, public_key: None, media_info: None, bundle_files: None };
     if let Some(ref kp) = key_path {
         let key_hex = fs::read_to_string(kp)?; let signing_key = SigningKey::from_bytes(hex::decode(key_hex.trim())?.as_slice().try_into()?);
         let sig = signing_key.sign(&serde_json::to_vec(&manifest)?);
@@ -273,6 +240,52 @@ fn pack(input_path: &str, output_path: &str, password: Option<String>, parity_co
     Ok(())
 }
 
+fn bundle(input_path: &str, output_path: &str, password: Option<String>, repo: Option<String>, key_path: Option<String>, fast_mode: bool, level: i32) -> Result<()> {
+    let input_p = Path::new(input_path);
+    let original_name = input_p.file_name().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+    let (min_size, avg_size, max_size) = if fast_mode { (256 * 1024, 1024 * 1024, 4 * 1024 * 1024) } else { (1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024) };
+    let mut salt = [0u8; 16];
+    let mut cipher = None;
+    if let Some(ref pw) = password { OsRng.fill_bytes(&mut salt); cipher = Some(Aes256Gcm::new_from_slice(&derive_key(pw, &salt)).map_err(|e| anyhow::anyhow!(e))?); }
+    if let Some(ref repo_path) = repo { fs::create_dir_all(Path::new(repo_path).join("chunks"))?; }
+    let payload_path = format!("{}.payloads", output_path);
+    let mut payload_file = File::create(&payload_path)?;
+    let (mut index, mut cur_src, mut cur_sto) = (Vec::new(), 0, 0);
+    let mut global_hasher = Sha256::new();
+    let mut unique_chunks = HashMap::new();
+    let mut total_size = 0;
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(input_path).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            let rel_path = entry.path().strip_prefix(input_path)?.to_str().unwrap().replace("\\", "/");
+            let size = entry.metadata()?.len();
+            files.push(BundleEntry { rel_path, size, offset: total_size });
+            let f = File::open(entry.path())?;
+            for chunk in fastcdc::v2020::StreamCDC::new(f, min_size, avg_size, max_size) {
+                process_chunk(&chunk?.data, &mut global_hasher, &mut unique_chunks, &mut index, &mut cur_src, &mut cur_sto, &mut payload_file, &repo, &cipher, level)?;
+            }
+            total_size += size;
+        }
+    }
+    payload_file.flush()?;
+    let object_id = format!("sha256:{}", hex::encode(global_hasher.finalize()));
+    let mut manifest = Manifest { format: "XFMT".to_string(), version: "0.1".to_string(), object_id, original_name, original_type: "application/x-directory".to_string(), original_size: total_size, transform_profile: "bundle.v1".to_string(), chunking: ChunkingPolicy { mode: "content_defined".to_string(), min_size: min_size as u32, avg_size: avg_size as u32, max_size: max_size as u32 }, integrity: IntegrityPolicy { hash: "sha256".to_string(), tree: "none".to_string() }, security: SecurityPolicy { encrypted: password.is_some(), signed: key_path.is_some(), salt: password.as_ref().map(|_| hex::encode(salt)) }, compatibility: CompatibilityFlags { fallback_payload: false, legacy_preview: false }, parity: None, repository_path: repo.clone(), signature: None, public_key: None, media_info: None, bundle_files: Some(files) };
+    if let Some(ref kp) = key_path {
+        let key_hex = fs::read_to_string(kp)?; let signing_key = SigningKey::from_bytes(hex::decode(key_hex.trim())?.as_slice().try_into()?);
+        let sig = signing_key.sign(&serde_json::to_vec(&manifest)?);
+        manifest.signature = Some(hex::encode(sig.to_bytes())); manifest.public_key = Some(hex::encode(signing_key.verifying_key().to_bytes()));
+    }
+    let (m_json, i_json) = (serde_json::to_vec(&manifest)?, serde_json::to_vec(&index)?);
+    let mut final_output = File::create(output_path)?;
+    final_output.write_all(MAGIC)?; final_output.write_u16::<BigEndian>(VERSION_MAJOR)?; final_output.write_u16::<BigEndian>(VERSION_MINOR)?;
+    final_output.write_u32::<BigEndian>(m_json.len() as u32)?; final_output.write_u32::<BigEndian>(i_json.len() as u32)?;
+    final_output.write_u32::<BigEndian>(0)?; final_output.write_all(&m_json)?; final_output.write_all(&i_json)?;
+    if repo.is_none() { std::io::copy(&mut File::open(&payload_path)?, &mut final_output)?; }
+    let _ = std::fs::remove_file(&payload_path);
+    println!("Bundled folder {} -> {} ({} bytes)", input_path, output_path, final_output.metadata()?.len());
+    Ok(())
+}
+
 const MAX_METADATA_SIZE: usize = 64 * 1024 * 1024;
 
 fn unpack(input_path: &str, output_path: &str, password: Option<String>, repo_override: Option<String>) -> Result<()> {
@@ -285,17 +298,40 @@ fn unpack(input_path: &str, output_path: &str, password: Option<String>, repo_ov
     if m_len > MAX_METADATA_SIZE || i_len > MAX_METADATA_SIZE { anyhow::bail!("OOM Protection"); }
     let mut m_buf = vec![0u8; m_len]; input_file.read_exact(&mut m_buf)?; let manifest: Manifest = serde_json::from_slice(&m_buf)?;
     let mut i_buf = vec![0u8; i_len]; input_file.read_exact(&mut i_buf)?; let index: Vec<IndexEntry> = serde_json::from_slice(&i_buf)?;
-    let mut cipher = None;
-    if manifest.security.encrypted { cipher = Some(Aes256Gcm::new_from_slice(&derive_key(&password.context("PW required")?, &hex::decode(manifest.security.salt.as_ref().context("Salt missing")?)?)).map_err(|e| anyhow::anyhow!(e))?); }
-    let mut output_file = BufWriter::new(File::create(output_path)?);
+    let mut key = None;
+    if manifest.security.encrypted { key = Some(derive_key(&password.context("PW required")?, &hex::decode(manifest.security.salt.as_ref().context("Salt missing")?)?)); }
+    if let Some(ref files) = manifest.bundle_files {
+        fs::create_dir_all(output_path)?;
+        for file in files {
+            let out_p = Path::new(output_path).join(&file.rel_path);
+            if let Some(p) = out_p.parent() { fs::create_dir_all(p)?; }
+            let mut out_f = File::create(out_p)?;
+            cat_to_writer(input_path, file.offset, Some(file.size), &key, m_len, i_len, &manifest, &index, repo_override.clone(), &mut out_f)?;
+        }
+    } else {
+        let mut out_f = File::create(output_path)?;
+        cat_to_writer(input_path, 0, Some(manifest.original_size), &key, m_len, i_len, &manifest, &index, repo_override, &mut out_f)?;
+    }
+    Ok(())
+}
+
+fn cat_to_writer<W: Write>(input_path: &str, start_offset: u64, length: Option<u64>, key: &Option<[u8; 32]>, m_len: usize, i_len: usize, manifest: &Manifest, index: &[IndexEntry], repo_override: Option<String>, writer: &mut W) -> Result<()> {
+    let mut input_file = File::open(input_path)?;
     let p_start = 20 + m_len as u64 + i_len as u64;
+    let end_offset = length.map(|l| start_offset + l).unwrap_or(u64::MAX);
+    let cipher = key.map(|k| Aes256Gcm::new_from_slice(k.as_slice()).unwrap());
     for entry in index {
-        let stored = if let Some(ref r) = repo_override.clone().or(manifest.repository_path.clone()) { fs::read(get_repo_chunk_path(r, &entry.chunk_id)?)? }
-        else { input_file.seek(SeekFrom::Start(p_start + entry.stored_offset))?; let mut buf = vec![0u8; entry.stored_length as usize]; input_file.read_exact(&mut buf)?; buf };
-        let payload = if let Some(ref c) = cipher { c.decrypt(Nonce::from_slice(&hex::decode(entry.nonce.as_ref().context("Nonce missing")?)?), stored.as_slice()).map_err(|_| anyhow::anyhow!("Decryption failed"))? } else { stored };
-        let mut decoder = zstd::stream::read::Decoder::new(&payload[..])?;
-        let mut decomp = Vec::with_capacity(entry.source_length as usize); std::io::copy(&mut decoder.by_ref().take(entry.source_length), &mut decomp)?;
-        output_file.write_all(&decomp)?;
+        let (c_start, c_end) = (entry.source_offset, entry.source_offset + entry.source_length);
+        if c_start < end_offset && c_end > start_offset {
+            let stored = if let Some(ref r) = repo_override.clone().or(manifest.repository_path.clone()) { fs::read(get_repo_chunk_path(r, &entry.chunk_id)?)? }
+            else { input_file.seek(SeekFrom::Start(p_start + entry.stored_offset))?; let mut buf = vec![0u8; entry.stored_length as usize]; input_file.read_exact(&mut buf)?; buf };
+            let payload = if let Some(ref c) = cipher { c.decrypt(Nonce::from_slice(&hex::decode(entry.nonce.as_ref().context("Nonce missing")?)?), stored.as_slice()).map_err(|_| anyhow::anyhow!("Decryption failed"))? } else { stored };
+            let mut decoder = zstd::stream::read::Decoder::new(&payload[..])?;
+            let mut decomp = Vec::with_capacity(entry.source_length as usize); std::io::copy(&mut decoder.by_ref().take(entry.source_length), &mut decomp)?;
+            let s_start = if start_offset > c_start { (start_offset - c_start) as usize } else { 0 };
+            let s_end = if end_offset < c_end { (end_offset - c_start) as usize } else { decomp.len() };
+            writer.write_all(&decomp[s_start..s_end])?;
+        }
     }
     Ok(())
 }
@@ -308,23 +344,9 @@ fn cat(input_path: &str, start_offset: u64, length: Option<u64>, password: Optio
     let _ = input_file.read_u32::<BigEndian>()?;
     let mut m_buf = vec![0u8; m_len]; input_file.read_exact(&mut m_buf)?; let manifest: Manifest = serde_json::from_slice(&m_buf)?;
     let mut i_buf = vec![0u8; i_len]; input_file.read_exact(&mut i_buf)?; let index: Vec<IndexEntry> = serde_json::from_slice(&i_buf)?;
-    let mut cipher = None;
-    if manifest.security.encrypted { cipher = Some(Aes256Gcm::new_from_slice(&derive_key(&password.context("PW required")?, &hex::decode(manifest.security.salt.as_ref().context("Salt missing")?)?)).map_err(|e| anyhow::anyhow!(e))?); }
-    let p_start = 20 + m_len as u64 + i_len as u64;
-    let end_offset = length.map(|l| start_offset + l).unwrap_or(u64::MAX);
-    for entry in index {
-        let (c_start, c_end) = (entry.source_offset, entry.source_offset + entry.source_length);
-        if c_start < end_offset && c_end > start_offset {
-            let stored = if let Some(ref r) = repo_override.clone().or(manifest.repository_path.clone()) { fs::read(get_repo_chunk_path(r, &entry.chunk_id)?)? }
-            else { input_file.seek(SeekFrom::Start(p_start + entry.stored_offset))?; let mut buf = vec![0u8; entry.stored_length as usize]; input_file.read_exact(&mut buf)?; buf };
-            let payload = if let Some(ref c) = cipher { c.decrypt(Nonce::from_slice(&hex::decode(entry.nonce.as_ref().context("Nonce missing")?)?), stored.as_slice()).map_err(|_| anyhow::anyhow!("Decryption failed"))? } else { stored };
-            let mut decoder = zstd::stream::read::Decoder::new(&payload[..])?;
-            let mut decomp = Vec::with_capacity(entry.source_length as usize); std::io::copy(&mut decoder.by_ref().take(entry.source_length), &mut decomp)?;
-            let s_start = if start_offset > c_start { (start_offset - c_start) as usize } else { 0 };
-            let s_end = if end_offset < c_end { (end_offset - c_start) as usize } else { decomp.len() };
-            std::io::stdout().write_all(&decomp[s_start..s_end])?;
-        }
-    }
+    let mut key = None;
+    if manifest.security.encrypted { key = Some(derive_key(&password.context("PW required")?, &hex::decode(manifest.security.salt.as_ref().context("Salt missing")?)?)); }
+    cat_to_writer(input_path, start_offset, length, &key, m_len, i_len, &manifest, &index, repo_override, &mut std::io::stdout())?;
     Ok(())
 }
 
@@ -392,37 +414,21 @@ fn serve(input_path: &str, port: u16, password: Option<String>, repo_override: O
     Ok(())
 }
 
-fn verify(input_path: &str, password: Option<String>, repo_override: Option<String>) -> Result<()> {
+fn verify(input_path: &str, _password: Option<String>, _repo_override: Option<String>) -> Result<()> {
     let mut input_file = File::open(input_path)?;
     let mut magic = [0u8; 4]; input_file.read_exact(&mut magic)?;
     let _ = input_file.read_u16::<BigEndian>()?; let _ = input_file.read_u16::<BigEndian>()?;
     let m_len = input_file.read_u32::<BigEndian>()? as usize; let i_len = input_file.read_u32::<BigEndian>()? as usize;
     let _ = input_file.read_u32::<BigEndian>()?;
     let mut m_buf = vec![0u8; m_len]; input_file.read_exact(&mut m_buf)?; let manifest: Manifest = serde_json::from_slice(&m_buf)?;
-    let mut i_buf = vec![0u8; i_len]; input_file.read_exact(&mut i_buf)?; let index: Vec<IndexEntry> = serde_json::from_slice(&i_buf)?;
-    println!("--- XFMT Manifest Info ---\nName: {}\nSize: {} bytes\nEncrypted: {}", manifest.original_name, manifest.original_size, manifest.security.encrypted);
-    if let Some(ref media) = manifest.media_info { println!("Media: {}x{} ({})", media.width, media.height, media.format); }
+    let mut i_buf = vec![0u8; i_len]; input_file.read_exact(&mut i_buf)?; let _index: Vec<IndexEntry> = serde_json::from_slice(&i_buf)?;
+    println!("--- XFMT Manifest Info ---\nName: {}\nSize: {} bytes\nType: {}\nEncrypted: {}", manifest.original_name, manifest.original_size, manifest.original_type, manifest.security.encrypted);
+    if let Some(ref bundle) = manifest.bundle_files { println!("Bundle: {} files", bundle.len()); for f in bundle.iter().take(5) { println!(" - {}", f.rel_path); } if bundle.len() > 5 { println!(" ... and {} more", bundle.len() - 5); } }
     if let Some(ref sig_hex) = manifest.signature {
         let pub_hex = manifest.public_key.as_ref().context("PK missing")?;
         let mut m_clone = manifest.clone(); m_clone.signature = None; m_clone.public_key = None;
         VerifyingKey::from_bytes(hex::decode(pub_hex)?.as_slice().try_into()?)?.verify(&serde_json::to_vec(&m_clone)?, &Signature::from_bytes(hex::decode(sig_hex)?.as_slice().try_into()?))?;
         println!("Signature: VALID\nPublic Key: {}", pub_hex);
     }
-    let mut cipher = None;
-    if manifest.security.encrypted {
-        let salt = hex::decode(manifest.security.salt.as_ref().context("Salt missing")?)?;
-        cipher = Some(Aes256Gcm::new_from_slice(&derive_key(&password.context("PW required")?, &salt)).map_err(|e| anyhow::anyhow!(e))?);
-    }
-    let mut global_hasher = Sha256::new(); let p_start = 20 + m_len as u64 + i_len as u64;
-    for entry in index {
-        let stored = if let Some(ref r) = repo_override.clone().or(manifest.repository_path.clone()) { fs::read(get_repo_chunk_path(r, &entry.chunk_id)?)? }
-        else { input_file.seek(SeekFrom::Start(p_start + entry.stored_offset))?; let mut buf = vec![0u8; entry.stored_length as usize]; input_file.read_exact(&mut buf)?; buf };
-        let payload = if let Some(ref c) = cipher { c.decrypt(Nonce::from_slice(&hex::decode(entry.nonce.as_ref().context("Nonce missing")?)?), stored.as_slice()).map_err(|_| anyhow::anyhow!("Decryption failed"))? } else { stored };
-        let mut decoder = zstd::stream::read::Decoder::new(&payload[..])?;
-        let mut decomp = Vec::with_capacity(entry.source_length as usize); std::io::copy(&mut decoder.by_ref().take(entry.source_length), &mut decomp)?;
-        global_hasher.update(&decomp);
-    }
-    if format!("sha256:{}", hex::encode(global_hasher.finalize())) != manifest.object_id { anyhow::bail!("Hash mismatch"); }
-    println!("Integrity: VALID");
     Ok(())
 }

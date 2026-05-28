@@ -18,6 +18,14 @@ pub struct Manifest {
     pub signature: Option<String>, // Hex encoded Ed25519 signature
     pub public_key: Option<String>, // Hex encoded public key
     pub media_info: Option<MediaInfo>, // Image/Video technical specs
+    pub bundle_files: Option<Vec<BundleEntry>>, // For folder archiving
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BundleEntry {
+    pub rel_path: String,
+    pub size: u64,
+    pub offset: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
