@@ -367,7 +367,16 @@ fn serve(input_path: &str, port: u16, password: Option<String>, repo_override: O
     println!("XFMT Server active at http://127.0.0.1:{}", port);
     if open_vlc {
         let url = format!("http://127.0.0.1:{}", port);
-        let _ = Command::new("C:\\Program Files\\VideoLAN\\VLC\\vlc.exe").arg(&url).spawn().or_else(|_| Command::new("vlc").arg(&url).spawn());
+        #[cfg(target_os = "windows")]
+        let _ = Command::new("vlc").arg(&url).spawn()
+            .or_else(|_| Command::new("C:\\Program Files\\VideoLAN\\VLC\\vlc.exe").arg(&url).spawn())
+            .or_else(|_| Command::new("C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe").arg(&url).spawn());
+
+        #[cfg(target_os = "macos")]
+        let _ = Command::new("open").arg("-a").arg("VLC").arg(&url).spawn();
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let _ = Command::new("vlc").arg(&url).spawn();
     }
     for stream in listener.incoming() {
         let mut stream = stream?;
