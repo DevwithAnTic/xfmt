@@ -35,6 +35,42 @@ On raw datasets (Text, Source, Binary), XFMT provides the following performance 
 - **Digital Signatures**: Ed25519 manifest signing to guarantee provenance.
 - **Streaming I/O**: True streaming architecture; process 100GB+ files with minimal RAM.
 
+## Installation
+
+### 1. Pre-compiled Binaries (Recommended)
+Download the latest version for your platform from the [GitHub Releases](https://github.com/your-repo/xfmt/releases) page.
+- **Windows:** `xfmt-x86_64-pc-windows-msvc.exe`
+- **Linux:** `xfmt-x86_64-unknown-linux-gnu`
+- **macOS:** `xfmt-macos-arm64` (Apple Silicon) or `xfmt-macos-x64` (Intel)
+- **Android:** `xfmt-android-aarch64` (Optimized for **Termux**)
+
+### 2. From Source (Cargo)
+Requires [Rust 1.75+](https://rustup.rs/):
+```bash
+git clone https://github.com/your-repo/xfmt.git
+cd xfmt
+cargo install --path .
+```
+
+## Requirements & Setup
+
+| Component | Status | Requirement |
+| :--- | :--- | :--- |
+| **Core Engine** | Mandatory | None (Standalone binary) |
+| **Media Streaming** | Optional | **VLC Media Player** (must be in system PATH) |
+| **RAR Support** | Optional | `rar` / `unrar` (Installed on system) |
+| **ZPAQ Support** | Optional | `zpaq` (Installed on system) |
+
+### Linux / Termux Setup
+Ensure VLC and optional tools are installed:
+```bash
+# Ubuntu/Debian
+sudo apt install vlc p7zip-full rar zpaq
+
+# Termux (Android)
+pkg install vlc-bin p7zip rar zpaq
+```
+
 ## Usage
 
 ### Packing & Bundling
