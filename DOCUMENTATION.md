@@ -1,4 +1,4 @@
-# XFMT Technical Manual: Deep Dive into Reversible Archiving
+# XFMT Technical Manual: eXtended File Multi-block Transformer
 
 ## Table of Contents
 1. **Introduction & Core Concepts**

@@ -23,7 +23,7 @@ use std::thread;
 
 #[derive(Parser)]
 #[command(name = "xfmt")]
-#[command(about = "Portable Reversible Transform Archive", long_about = None)]
+#[command(about = "eXtended File Multi-block Transformer", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

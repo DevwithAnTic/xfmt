@@ -9,7 +9,9 @@ Cargo.lock
 
 # Test Data
 docs/
-test_files/
+tests/
+tools/
+bench/
 /test_repo
 /my_repo
 bench.dat
