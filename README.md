@@ -58,17 +58,15 @@ cargo install --path .
 | :--- | :--- | :--- |
 | **Core Engine** | Mandatory | None (Standalone binary) |
 | **Media Streaming** | Optional | **VLC Media Player** (must be in system PATH) |
-| **RAR Support** | Optional | `rar` / `unrar` (Installed on system) |
-| **ZPAQ Support** | Optional | `zpaq` (Installed on system) |
 
 ### Linux / Termux Setup
-Ensure VLC and optional tools are installed:
+Ensure VLC is installed:
 ```bash
 # Ubuntu/Debian
-sudo apt install vlc p7zip-full rar zpaq
+sudo apt install vlc
 
 # Termux (Android)
-pkg install vlc-bin p7zip rar zpaq
+pkg install vlc-bin
 ```
 
 ## Usage
