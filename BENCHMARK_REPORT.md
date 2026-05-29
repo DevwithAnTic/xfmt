@@ -4,13 +4,13 @@ This report compares XFMT against several industry-standard compression formats,
 
 ## Summary
 
-![Compression Ratio](docs/plots/ratio_plot.png)
+![Compression Ratio](plots/ratio_plot.png)
 *Lower is better. Comparison of archive size relative to original.*
 
-![Compression Speed](docs/plots/c_speed_plot.png)
+![Compression Speed](plots/c_speed_plot.png)
 *Higher is better. Measured in MB/s.*
 
-![Random Access Time](docs/plots/random_access_plot.png)
+![Random Access Time](plots/random_access_plot.png)
 *Lower is better. Time to seek and read 100KB from the middle of the archive (Log Scale).*
 
 | Metric | XFMT (Zstd + CDC) | Tar-XZ | 7-Zip (LZMA2) | Winner |
