@@ -78,6 +78,9 @@ enum Commands {
         /// Override repository path
         #[arg(short, long)]
         repo: Option<String>,
+        /// Limit output to N lines
+        #[arg(short = 'n', long)]
+        lines: Option<usize>,
     },
     /// Verify the integrity and signature of an XFMT file (alias: ls)
     #[command(alias = "ls")]
@@ -103,6 +106,15 @@ enum Commands {
         #[arg(short, long)]
         vlc: bool,
     },
+    /// Peek at the metadata and first few bytes of an XFMT file
+    Peek {
+        input: String,
+        #[arg(short, long)]
+        password: Option<String>,
+        /// Override repository path
+        #[arg(short, long)]
+        repo: Option<String>,
+    },
     /// Generate a new Ed25519 key pair for signing
     GenKey {
         output: String,
@@ -124,9 +136,10 @@ fn main() -> Result<()> {
             }
         },
         Commands::Unpack { input, output, password, repo } => unpack(&input, &output, password, repo)?,
-        Commands::Cat { input, offset, length, password, repo } => cat(&input, offset, length, password, repo)?,
+        Commands::Cat { input, offset, length, password, repo, lines } => cat(&input, offset, length, password, repo, lines)?,
         Commands::Verify { input, password, repo } => verify(&input, password, repo)?,
         Commands::Serve { input, port, password, repo, vlc } => serve(&input, port, password, repo, vlc)?,
+        Commands::Peek { input, password, repo } => peek(&input, password, repo)?,
         Commands::GenKey { output } => gen_key(&output)?,
     }
 
@@ -224,6 +237,9 @@ fn pack(input_path: &str, output_path: &str, password: Option<String>, _parity_c
     payload_file.flush()?;
     let object_id = format!("sha256:{}", hex::encode(global_hasher.finalize()));
     let mut manifest = Manifest { format: "XFMT".to_string(), version: "0.1".to_string(), object_id, original_name, original_type, original_size, transform_profile: "generic.reversible.v1".to_string(), chunking: ChunkingPolicy { mode: "content_defined".to_string(), min_size: min_size as u32, avg_size: avg_size as u32, max_size: max_size as u32 }, integrity: IntegrityPolicy { hash: "sha256".to_string(), tree: "none".to_string() }, security: SecurityPolicy { encrypted: password.is_some(), signed: key_path.is_some(), salt: password.as_ref().map(|_| hex::encode(salt)) }, compatibility: CompatibilityFlags { fallback_payload: false, legacy_preview: false }, parity: None, repository_path: repo.clone(), signature: None, public_key: None, media_info: None, bundle_files: None };
+    if let Ok(dim) = imagesize::size(input_path) {
+        manifest.media_info = Some(MediaInfo { width: dim.width, height: dim.height, format: manifest.original_type.clone() });
+    }
     if let Some(ref kp) = key_path {
         let key_hex = fs::read_to_string(kp)?; let signing_key = SigningKey::from_bytes(hex::decode(key_hex.trim())?.as_slice().try_into()?);
         let sig = signing_key.sign(&serde_json::to_vec(&manifest)?);
@@ -336,7 +352,7 @@ fn cat_to_writer<W: Write>(input_path: &str, start_offset: u64, length: Option<u
     Ok(())
 }
 
-fn cat(input_path: &str, start_offset: u64, length: Option<u64>, password: Option<String>, repo_override: Option<String>) -> Result<()> {
+fn cat(input_path: &str, start_offset: u64, length: Option<u64>, password: Option<String>, repo_override: Option<String>, lines: Option<usize>) -> Result<()> {
     let mut input_file = File::open(input_path)?;
     let mut magic = [0u8; 4]; input_file.read_exact(&mut magic)?;
     let _ = input_file.read_u16::<BigEndian>()?; let _ = input_file.read_u16::<BigEndian>()?;
@@ -346,7 +362,18 @@ fn cat(input_path: &str, start_offset: u64, length: Option<u64>, password: Optio
     let mut i_buf = vec![0u8; i_len]; input_file.read_exact(&mut i_buf)?; let index: Vec<IndexEntry> = serde_json::from_slice(&i_buf)?;
     let mut key = None;
     if manifest.security.encrypted { key = Some(derive_key(&password.context("PW required")?, &hex::decode(manifest.security.salt.as_ref().context("Salt missing")?)?)); }
-    cat_to_writer(input_path, start_offset, length, &key, m_len, i_len, &manifest, &index, repo_override, &mut std::io::stdout())?;
+    
+    if let Some(limit) = lines {
+        let mut buffer = Vec::new();
+        cat_to_writer(input_path, start_offset, length, &key, m_len, i_len, &manifest, &index, repo_override, &mut buffer)?;
+        let content = String::from_utf8_lossy(&buffer);
+        for (i, line) in content.lines().enumerate() {
+            if i >= limit { break; }
+            println!("{}", line);
+        }
+    } else {
+        cat_to_writer(input_path, start_offset, length, &key, m_len, i_len, &manifest, &index, repo_override, &mut std::io::stdout())?;
+    }
     Ok(())
 }
 
@@ -439,5 +466,40 @@ fn verify(input_path: &str, _password: Option<String>, _repo_override: Option<St
         VerifyingKey::from_bytes(hex::decode(pub_hex)?.as_slice().try_into()?)?.verify(&serde_json::to_vec(&m_clone)?, &Signature::from_bytes(hex::decode(sig_hex)?.as_slice().try_into()?))?;
         println!("Signature: VALID\nPublic Key: {}", pub_hex);
     }
+    Ok(())
+}
+
+fn peek(input_path: &str, password: Option<String>, repo_override: Option<String>) -> Result<()> {
+    let mut input_file = File::open(input_path)?;
+    let mut magic = [0u8; 4]; input_file.read_exact(&mut magic)?;
+    let _ = input_file.read_u16::<BigEndian>()?; let _ = input_file.read_u16::<BigEndian>()?;
+    let m_len = input_file.read_u32::<BigEndian>()? as usize; let i_len = input_file.read_u32::<BigEndian>()? as usize;
+    let _ = input_file.read_u32::<BigEndian>()?;
+    let mut m_buf = vec![0u8; m_len]; input_file.read_exact(&mut m_buf)?; let manifest: Manifest = serde_json::from_slice(&m_buf)?;
+    let mut i_buf = vec![0u8; i_len]; input_file.read_exact(&mut i_buf)?; let index: Vec<IndexEntry> = serde_json::from_slice(&i_buf)?;
+    
+    println!("--- XFMT Peek: {} ---", manifest.original_name);
+    println!("Type: {} | Size: {} bytes", manifest.original_type, manifest.original_size);
+    if let Some(ref mi) = manifest.media_info { println!("Media: {}x{} ({})", mi.width, mi.height, mi.format); }
+    
+    let mut key = None;
+    if manifest.security.encrypted { key = Some(derive_key(&password.context("PW required")?, &hex::decode(manifest.security.salt.as_ref().context("Salt missing")?)?)); }
+    
+    println!("\n--- Content Preview (First 1024 bytes) ---");
+    let mut preview = Vec::new();
+    cat_to_writer(input_path, 0, Some(1024), &key, m_len, i_len, &manifest, &index, repo_override, &mut preview)?;
+    
+    let is_likely_text = manifest.original_type.starts_with("text") || manifest.original_type.contains("json") || manifest.original_type.contains("xml") || preview.iter().take(256).all(|&b| b == 0x0A || b == 0x0D || (b >= 0x20 && b <= 0x7E));
+    
+    if is_likely_text {
+        println!("{}", String::from_utf8_lossy(&preview));
+    } else {
+        for (i, chunk) in preview.chunks(16).enumerate() {
+            print!("{:08x}: ", i * 16);
+            for byte in chunk { print!("{:02x} ", byte); }
+            println!();
+        }
+    }
+    
     Ok(())
 }

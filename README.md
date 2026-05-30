@@ -86,17 +86,29 @@ xfmt pack input.dat --fast
 xfmt pack input.dat --level 19
 ```
 
-### Unpacking & Media Streaming
+### Unpacking & Instant Viewing
 ```bash
 # Extract full file or folder
 xfmt unpack output.xfmt restored_data
 
+# Peek at metadata and content preview (First 1KB)
+xfmt peek data.jpg.xfmt
+
 # Instant Video Playback (with timeline and seeking)
 xfmt serve movie.mp4.xfmt --vlc
 
-# Read a specific byte range to stdout
+# Read a specific byte range to stdout (works for text)
 xfmt cat output.xfmt --offset 1024 --length 512
 ```
+
+### Zero-Extraction Viewing
+| File Type | Method | Command |
+| :--- | :--- | :--- |
+| **Video** | VLC Stream | `xfmt serve video.xfmt --vlc` |
+| **Image / PDF**| Browser | `xfmt serve file.xfmt` -> Open browser to localhost:8080 |
+| **Audio** | VLC / Browser| `xfmt serve audio.xfmt` |
+| **Text / JSON** | Terminal | `xfmt cat file.txt.xfmt` |
+| **Metadata** | Terminal | `xfmt peek file.xfmt` |
 
 ### Security & Provenance
 ```bash
