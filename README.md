@@ -121,6 +121,3 @@ xfmt pack input.dat --key my_key
 # 3. Verify integrity and signature
 xfmt verify output.xfmt
 ```
-
-## Documentation
-See the `docs/` folder or `DOCUMENTATION.pdf` for the full technical manual.
